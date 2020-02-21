@@ -16,6 +16,7 @@ from utils.params import ParamDict
 from utils.tf.data import encode_string, encode_float, encode_image
 
 class TFRecordGenerator:
+    """ generate TFRecord Datasets from h5 files """
 
     DEFAULT_PARAMS=ParamDict(
         # root directory of the raw h5 data
@@ -50,6 +51,15 @@ class TFRecordGenerator:
         os.makedirs(os.path.join(self.args.output, 'validation'), exist_ok=True)
 
     def _scan_and_sample_dataset(self, dives):
+        """ scan for umatched or corrupted h5 files
+
+        Args:
+            dives:  list of dive directory names
+
+        Returns:
+            list:   valid h5 files with sampled indices in the format of
+                    [(filename, idx), (filename, idx), ...]
+        """
         roots = [os.path.join(self.p.data_root, n) for n in dives]
         ret = []
         for root in roots:
@@ -81,22 +91,51 @@ class TFRecordGenerator:
         return parser.parse_args()
 
     def shard_path(self, shard_id, training=True):
+        """ generate shard path based on train / val split and shard ID
+
+        Args:
+            shard_id (int):     shard ID
+            training (bool):    True if training dataset, otherwise validation
+
+        Returns:
+            str: path to the output tfrecord shard
+        """
         sub_dir = 'train' if training else 'validation'
         fname = 'shard-{}.tfrecord'.format(shard_id)
         return os.path.join(self.args.output, sub_dir, fname)
 
     def serialize_sample(self, sample_dict):
+        """ serialize a single data sample into TF Example
+
+        Args:
+            sample_dict (dict): a single data sample in the following format
+            {
+                'image' (np.ndarray):   raw sensor image
+                'gps' (float, float):   (latitude, longitude)
+                'dive' (str):           the dive it belongs to
+                'datetime':             datetime when the image is captured
+            }
+
+        Returns:
+        """
         azimuth, elevation = sl.get_position(
             sample_dict['gps'][0], sample_dict['gps'][1], sample_dict['datetime'])
         feature = {
             'image_png':    encode_image(sample_dict['image']),
             'azimuth':      encode_float(azimuth),
             'elevation':    encode_float(elevation),
+            'dive':         encode_string(sample_dict['dive'].encode()),
         }
         example = tf.train.Example(features=tf.train.Features(feature=feature))
         return example.SerializeToString()
 
     def worker(self, worker_id, training=True):
+        """ worker function
+
+        Args:
+            worker_id (int):    ID of the worker
+            training (bool):    True if generating training dataset, otherwise validation
+        """
         example_list = self.train if training else self.validation
         num_shards = int(np.ceil(len(example_list) / self.p.shard_size))
         for shard_id in range(num_shards):
