@@ -1,4 +1,6 @@
 import argparse
+import os
+import time
 import tensorflow as tf
 
 from utils.params import ParamDict
@@ -17,7 +19,7 @@ class Trainer:
         self.args = self.parse_arguments()
         self.p = ParamDict.from_file(self.args.params)
         self.model = RegressorModel(self.p.regressor).create_model()
-        self.dataset = RegressorDataPipeline(self.p.data).construct_train_dataset()
+        self.data = RegressorDataPipeline(self.p.data)
 
     def parse_arguments(self):
         parser = argparse.ArgumentParser()
@@ -30,7 +32,25 @@ class Trainer:
     def run(self):
         optimizer = self.p.trainer.optimizer_func()
         self.model.compile(loss='mse', optimizer=optimizer, metrics=['mae', 'mse'])
-        self.model.fit(self.dataset)
+        log_dir = os.path.join(self.args.log_dir, time.strftime('%Y-%m-%d-%H-%M-%S'))
+        os.makedirs(log_dir)
+        callbacks = [
+            K.callbacks.ModelCheckpoint(
+                filepath=os.path.join(log_dir, '{epoch:03d}.h5'),
+                save_weights_only=True,
+            ),
+            K.callbacks.TensorBoard(
+                log_dir=log_dir,
+                update_freq=self.p.trainer.log_steps,
+                histogram_freq=1,
+               profile_batch=0,
+            ),
+            K.callbacks.LearningRateScheduler(self.p.trainer.lr_schedule),
+        ]
+        self.model.fit(self.data.train_dataset,
+                       validation_data=self.data.val_dataset,
+                       epochs=self.p.trainer.num_epochs,
+                       callbacks=callbacks)
 
 if __name__ == '__main__':
     Trainer().run()

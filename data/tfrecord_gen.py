@@ -11,7 +11,7 @@ from multiprocessing import Process
 from tqdm import tqdm
 
 from data.parser_v1 import FrameGroup, DiveMeta
-from utils.console import print_warn, print_ok
+from utils.console import print_warn, print_ok, print_info
 from utils.params import ParamDict
 from utils.tf.data import encode_string, encode_float, encode_image
 
@@ -25,9 +25,9 @@ class TFRecordGenerator:
         train=['010720DIVE1',
                '010820DIVE1', '010820DIVE2', '010820DIVE3',
                '010920DIVE1', '010920DIVE2', '010920DIVE3',
-               '011020DIVE1', '011020DIVE2'],
+               '011020DIVE1', '011020DIVE3'],
         # dives used for validation
-        validation=['011020DIVE3'],
+        validation=['011020DIVE2'],
         # meta file that store dive information
         meta='/home/alvin_sun/01xx20_dive_data.txt',
         # maximum number of samples per tfrecord shard
@@ -152,17 +152,28 @@ class TFRecordGenerator:
 
     def run(self):
         pool = []
+        # training dataset generation
+        print_info('start converting training dataset')
         for i in range(self.args.jobs):
             p = Process(target=self.worker, args=(i, True))
             p.start()
             pool.append(p)
-        # wait for all workers to finish
-        while len(pool):
+        while len(pool): # wait for all workers to join
             pool.insert(0, pool.pop())
             if not pool[-1].is_alive():
                 pool[-1].join()
                 del pool[-1]
-
+        # validation dataset generation
+        print_info('start converting validation dataset')
+        for i in range(self.args.jobs):
+            p = Process(target=self.worker, args=(i, False))
+            p.start()
+            pool.append(p)
+        while len(pool): # wait for all workers to join
+            pool.insert(0, pool.pop())
+            if not pool[-1].is_alive():
+                pool[-1].join()
+                del pool[-1]
 
 if __name__ == '__main__':
     tqdm.get_lock()
