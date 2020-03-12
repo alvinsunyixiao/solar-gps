@@ -2,6 +2,7 @@ import numpy as np
 import tensorflow as tf
 
 from utils.params import ParamDict as o
+from utils.tf.augment import sometimes, additive_gaussian_noise
 
 K = tf.keras
 KL = tf.keras.layers
@@ -41,6 +42,25 @@ class SameConvBNReLU(KL.Layer):
         return x
 
 
+class PreProcessor(KL.Layer):
+
+    def __init__(self, **kwargs):
+        super(PreProcessor, self).__init__(**kwargs)
+
+    def call(self, input_bchw):
+        # normalize image
+        input_bchw = tf.cast(input_bchw, tf.float32)
+        input_bchw = input_bchw / 255
+        # augment image
+        if K.backend.learning_phase() == True:
+            input_bchw = sometimes(input_bchw, 0.4,
+                fn=lambda inp: additive_gaussian_noise(inp, 0, (0, .05)))
+            input_bchw = sometimes(input_bchw, 0.6,
+                fn=lambda inp: tf.image.random_brightness(inp, 0.1))
+
+        return input_bchw
+
+
 class DeWarp(KL.Layer):
 
     def __init__(self, dewarp_hw, radius_range, **kwargs):
@@ -57,17 +77,19 @@ class DeWarp(KL.Layer):
         Returns:
             AoP
         """
-        image_b1hw = tf.cast(image_b1hw, tf.float32)
         i0_b1hw = image_b1hw[..., ::2, ::2]
         i45_b1hw = image_b1hw[..., ::2, 1::2]
         i90_b1hw = image_b1hw[..., 1::2, 1::2]
         i135_b1hw = image_b1hw[..., 1::2, ::2]
 
-        s0_b1hw = i0_b1hw + i90_b1hw
+        s0_b1hw = .5 * (i0_b1hw + i45_b1hw + i90_b1hw + i135_b1hw)
         s1_b1hw = i0_b1hw - i90_b1hw
         s2_b1hw = i45_b1hw - i135_b1hw
 
-        aop_b1hw = .5 * tf.atan2(s2_b1hw, s1_b1hw)
+        aop_b1hw = .5 * tf.atan(tf.math.divide_no_nan(s2_b1hw, s1_b1hw))
+        dop_b1hw = tf.math.divide_no_nan(tf.sqrt(s1_b1hw**2+s2_b1hw**2), s0_b1hw)
+
+        aop_b1hw = aop_b1hw * tf.cast(dop_b1hw > 0.05, tf.float32)
 
         return aop_b1hw
 
@@ -80,12 +102,14 @@ class DeWarp(KL.Layer):
         # convert to polar coordinates
         r_hw = (Rmax - Rmin) / H * (H - y_hw) + Rmin
         theta_hw = 2 * np.pi / W * (W - x_hw)
-        # random rotation augmentation
-        theta_hw += tf.random.uniform([], 0, 2*np.pi)
+        center_yx_2 = tf.cast(tf.shape(polar_b1hw)[2:4], tf.float32) // 2
+        # random rotation and translation augmentation
+        if K.backend.learning_phase() == True:
+            theta_hw += tf.random.uniform([], 0, 2*np.pi)
+            center_yx_2 += tf.random.uniform(tf.shape(center_yx_2), -30, 30)
         # put back into cartesian coordinates of the fisheye image
-        polar_shape = tf.cast(tf.shape(polar_b1hw), tf.float32)
-        polar_y_hw = -r_hw * tf.sin(theta_hw) + polar_shape[2] // 2
-        polar_x_hw = r_hw * tf.cos(theta_hw) + polar_shape[3] // 2
+        polar_y_hw = -r_hw * tf.sin(theta_hw) + center_yx_2[0]
+        polar_x_hw = r_hw * tf.cos(theta_hw) + center_yx_2[1]
         # round to nearest neighbor
         polar_y_hw = tf.cast(tf.round(polar_y_hw), tf.int32)
         polar_x_hw = tf.cast(tf.round(polar_x_hw), tf.int32)
@@ -93,7 +117,7 @@ class DeWarp(KL.Layer):
         channel_0_hw = tf.zeros_like(polar_y_hw)
         polar_0yx_hw3 = tf.stack([channel_0_hw, polar_y_hw, polar_x_hw], axis=-1)
         polar_0yx_bhw3 = tf.tile(polar_0yx_hw3[tf.newaxis, ...],
-                                 [polar_shape[0], 1, 1, 1])
+                                 [tf.shape(polar_b1hw)[0], 1, 1, 1])
         batch_b_b = tf.range(tf.shape(polar_b1hw)[0])
         batch_b_b111 = batch_b_b[:, tf.newaxis, tf.newaxis, tf.newaxis]
         batch_b_bhw1 = tf.tile(batch_b_b111, [1, H, W, 1])
@@ -129,6 +153,7 @@ class ResBlock(KL.Layer):
             kernel_size=3,
             strides=1,
             weight_decay=weight_decay,
+            has_relu=False,
             trainable=self.trainable,
             name='conv2',
         )
@@ -137,43 +162,40 @@ class ResBlock(KL.Layer):
             kernel_size=1,
             strides=2 if strided else 1,
             weight_decay=weight_decay,
+            has_relu=False,
             trainable=self.trainable,
             name='projection',
         ) if projection else None
+        self.final_relu = KL.ReLU(name='final_relu')
 
     def call(self, x):
         x1 = self.conv1(x)
         x1 = self.conv2(x1)
         if self.projection is not None:
             x = self.projection(x)
-        return x + x1
+        return self.final_relu(x + x1)
 
 class RegressorModel:
 
     DEFAULT_PARAMS=o(
         input_hw=(2048, 2448),
         batch_size=128,
-        weight_decay=1e-4,
-        dewarp_hw=(32, 512),
-        radius_range=(280, 400),
+        weight_decay=1e-3,
+        dewarp_hw=(32, 256),
+        radius_range=(240, 480),
     )
 
     def __init__(self, params=DEFAULT_PARAMS):
-        assert K.backend.image_data_format() == 'channels_first', \
-               'Image data format has to be channels first!'
+        if K.backend.image_data_format() != 'channels_first':
+            K.backend.set_image_data_format('channels_first')
         self.p = params
+        self.preprocess = PreProcessor()
         self.dewarp = DeWarp(self.p.dewarp_hw, self.p.radius_range)
-        self.conv1 = SameConvBNReLU(8, (7, 7), 2, weight_decay=self.p.weight_decay)
-        self.pool2 = KL.MaxPool2D(strides=2, padding='same')
         self.res_blocks = [
-            ResBlock(8, projection=True, weight_decay=self.p.weight_decay),
-            ResBlock(8, weight_decay=self.p.weight_decay),
-            ResBlock(16, strided=True, weight_decay=self.p.weight_decay),
-            ResBlock(16, weight_decay=self.p.weight_decay),
-            ResBlock(32, strided=True, weight_decay=self.p.weight_decay),
-            ResBlock(32, weight_decay=self.p.weight_decay),
-            ResBlock(64, strided=True, weight_decay=self.p.weight_decay),
-            ResBlock(64, weight_decay=self.p.weight_decay),
+            ResBlock(2, strided=True, weight_decay=self.p.weight_decay),
+            ResBlock(4, strided=True, weight_decay=self.p.weight_decay),
+            ResBlock(2, strided=True, weight_decay=self.p.weight_decay),
+            ResBlock(1, strided=True, weight_decay=self.p.weight_decay),
         ]
         self.reduce = KL.Dense(
             units=1,
@@ -182,9 +204,8 @@ class RegressorModel:
 
     def create_model(self):
         inp = KL.Input(shape=(1,) + self.p.input_hw)
-        x = self.dewarp(inp)
-        x = self.conv1(x)
-        x = self.pool2(x)
+        x = self.preprocess(inp)
+        x = self.dewarp(x)
         for res_block in self.res_blocks:
             x = res_block(x)
         x = KL.Reshape([np.prod(x.shape[1:])])(x)

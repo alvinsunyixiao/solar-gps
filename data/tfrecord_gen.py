@@ -28,12 +28,16 @@ class TFRecordGenerator:
                '011020DIVE1', '011020DIVE3'],
         # dives used for validation
         validation=['011020DIVE2'],
+        # split trainv / val within dives
+        even_split=True,
+        # only valid when even_split is True
+        train_ratio=0.9,
         # meta file that store dive information
         meta='/home/alvin_sun/01xx20_dive_data.txt',
         # maximum number of samples per tfrecord shard
         shard_size=1000,
         # randomly sample this portion of the original dive data per h5 file
-        downsample=0.05,
+        downsample=0.1,
     )
 
     def __init__(self):
@@ -42,8 +46,15 @@ class TFRecordGenerator:
         if self.args.params is not None:
             self.p = ParamDict.from_file(self.args.params)
         self.meta = DiveMeta(self.p.meta)
-        self.train = self._scan_and_sample_dataset(self.p.train)
-        self.validation = self._scan_and_sample_dataset(self.p.validation)
+        if self.p.even_split:
+            all_data = self._scan_and_sample_dataset(self.p.train + self.p.validation)
+            random.shuffle(all_data)
+            split_idx = int(len(all_data) * self.p.train_ratio)
+            self.train = all_data[:split_idx]
+            self.validation = all_data[split_idx:]
+        else:
+            self.train = self._scan_and_sample_dataset(self.p.train)
+            self.validation = self._scan_and_sample_dataset(self.p.validation)
         print_ok('Successfully loaded {} training examples'.format(len(self.train)))
         print_ok('Successfully loaded {} validation examples'.format(len(self.validation)))
         # make sure output directories are setup
